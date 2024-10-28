@@ -1,59 +1,90 @@
 #include "sdl_starter.h"
 #include "sdl_assets_loader.h"
-#include <time.h>
-#include <unistd.h> // chdir header
+#include <unistd.h>
 #include <romfs-wiiu.h>
 #include <whb/proc.h>
+#include <vector>
 
 SDL_Window *window = nullptr;
 SDL_Renderer *renderer = nullptr;
 SDL_GameController *controller = nullptr;
 
-const int PLAYER_SPEED = 600;
-
-Sprite playerSprite;
-
-Mix_Music *music = nullptr;
-Mix_Chunk *sound = nullptr;
-
 bool isGamePaused;
+int shouldCloseTheGame = 0;
 
 SDL_Texture *pauseGameTexture = nullptr;
 SDL_Rect pauseGameBounds;
 
+TTF_Font *font = nullptr;
+
 SDL_Texture *scoreTexture = nullptr;
 SDL_Rect scoreBounds;
 
-int score;
+SDL_Texture *liveTexture = nullptr;
+SDL_Rect liveBounds;
 
-TTF_Font *font = nullptr;
+Mix_Chunk *collisionSound = nullptr;
+Mix_Chunk *collisionWithPlayerSound = nullptr;
 
-bool shouldCloseTheGame;
+SDL_Rect player = {SCREEN_WIDTH / 2, SCREEN_HEIGHT - 32, 74, 16};
 
-SDL_Rect ball = {SCREEN_WIDTH / 2 + 50, SCREEN_HEIGHT / 2, 32, 32};
+int playerScore;
+int playerLives = 2;
+int playerSpeed = 800;
 
-int ballVelocityX = 400;
-int ballVelocityY = 400;
+SDL_Rect ball = {SCREEN_WIDTH / 2 - 20, SCREEN_HEIGHT / 2 - 20, 20, 20};
 
-int colorIndex;
+int ballVelocityX = 425;
+int ballVelocityY = 425;
 
-SDL_Color colors[] = {
-    {128, 128, 128, 0}, // gray
-    {255, 255, 255, 0}, // white
-    {255, 0, 0, 0},     // red
-    {0, 255, 0, 0},     // green
-    {0, 0, 255, 0},     // blue
-    {255, 255, 0, 0},   // brown
-    {0, 255, 255, 0},   // cyan
-    {255, 0, 255, 0},   // purple
-};
+bool isAutoPlayMode = true;
+
+typedef struct
+{
+    SDL_Rect bounds;
+    bool isDestroyed;
+    int points;
+} Brick;
+
+std::vector<Brick> createBricks()
+{
+    std::vector<Brick> bricks;
+    bricks.reserve(200);
+
+    int brickPoints = 10;
+    int positionX;
+    int positionY = 50;
+
+    for (int row = 0; row < 10; row++)
+    {
+        positionX = 0;
+
+        for (int column = 0; column < 20; column++)
+        {
+            Brick actualBrick = {{positionX, positionY, 60, 20}, false, brickPoints};
+
+            bricks.push_back(actualBrick);
+            positionX += 64;
+        }
+
+        brickPoints--;
+        positionY += 22;
+    }
+
+    return bricks;
+}
+
+std::vector<Brick> bricks = createBricks();
 
 void quitGame()
 {
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
+    Mix_HaltChannel(-1);
+    IMG_Quit();
+    Mix_CloseAudio();
+    TTF_Quit();
+    Mix_Quit();
     SDL_Quit();
-    WHBProcShutdown();
+    romfsExit();
 }
 
 void handleEvents()
@@ -64,91 +95,105 @@ void handleEvents()
     {
         if (event.type == SDL_QUIT)
         {
-            shouldCloseTheGame = true;
-            break;
+            shouldCloseTheGame = 1;
         }
 
         if (event.type == SDL_JOYBUTTONDOWN)
         {
             if (event.jbutton.button == BUTTON_MINUS)
             {
-                shouldCloseTheGame = true;
-                break;
+                shouldCloseTheGame = 1;
             }
 
             if (event.jbutton.button == BUTTON_PLUS)
             {
                 isGamePaused = !isGamePaused;
-                Mix_PlayChannel(-1, sound, 0);
+                Mix_PlayChannel(-1, collisionWithPlayerSound, 0);
+            }
+
+            if (event.jbutton.button == BUTTON_A)
+            {
+                isAutoPlayMode = !isAutoPlayMode;
+                Mix_PlayChannel(-1, collisionSound, 0);
             }
         }
     }
 }
 
-int rand_range(int min, int max)
-{
-    return min + rand() / (RAND_MAX / (max - min + 1) + 1);
-}
-
 void update(float deltaTime)
 {
-    if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_UP) && playerSprite.textureBounds.y > 0)
+    if (isAutoPlayMode && ball.x < SCREEN_WIDTH - player.w)
     {
-        playerSprite.textureBounds.y -= PLAYER_SPEED * deltaTime;
+        player.x = ball.x;
     }
 
-    else if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN) && playerSprite.textureBounds.y < SCREEN_HEIGHT - playerSprite.textureBounds.h)
+    if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT) && player.x > 0)
     {
-        playerSprite.textureBounds.y += PLAYER_SPEED * deltaTime;
+        player.x -= playerSpeed * deltaTime;
     }
 
-    else if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT) && playerSprite.textureBounds.x > 0)
+    else if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) && player.x < SCREEN_WIDTH - player.w)
     {
-        playerSprite.textureBounds.x -= PLAYER_SPEED * deltaTime;
+        player.x += playerSpeed * deltaTime;
     }
 
-    else if (SDL_GameControllerGetButton(controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) && playerSprite.textureBounds.x < SCREEN_WIDTH - playerSprite.textureBounds.w)
+    if (ball.y > SCREEN_HEIGHT + ball.h)
     {
-        playerSprite.textureBounds.x += PLAYER_SPEED * deltaTime;
+        ball.x = SCREEN_WIDTH / 2 - ball.w;
+        ball.y = SCREEN_HEIGHT / 2 - ball.h;
+
+        ballVelocityX *= -1;
+
+        if (playerLives > 0)
+        {
+            playerLives--;
+
+            std::string livesString = "lives: " + std::to_string(playerLives);
+
+            updateTextureText(liveTexture, livesString.c_str(), font, renderer);
+        }
     }
 
     if (ball.x < 0 || ball.x > SCREEN_WIDTH - ball.w)
     {
         ballVelocityX *= -1;
-
-        colorIndex = rand_range(0, 5);
+        Mix_PlayChannel(-1, collisionSound, 0);
     }
 
-    else if (ball.y < 0 || ball.y > SCREEN_HEIGHT - ball.h)
+    if (SDL_HasIntersection(&player, &ball) || ball.y < 0)
     {
         ballVelocityY *= -1;
-
-        colorIndex = rand_range(0, 5);
+        Mix_PlayChannel(-1, collisionWithPlayerSound, 0);
     }
 
-    else if (SDL_HasIntersection(&playerSprite.textureBounds, &ball))
+    for (auto actualBrick = bricks.begin(); actualBrick != bricks.end();)
     {
-        ballVelocityX *= -1;
-        ballVelocityY *= -1;
+        if (!actualBrick->isDestroyed && SDL_HasIntersection(&actualBrick->bounds, &ball))
+        {
+            ballVelocityY *= -1;
+            actualBrick->isDestroyed = true;
 
-        colorIndex = rand_range(0, 5);
+            playerScore += actualBrick->points;
 
-        Mix_PlayChannel(-1, sound, 0);
+            std::string scoreString = "score: " + std::to_string(playerScore);
 
-        score++;
+            updateTextureText(scoreTexture, scoreString.c_str(), font, renderer);
 
-        std::string scoreString = "SCORE: " + std::to_string(score);
+            Mix_PlayChannel(-1, collisionSound, 0);
+        }
 
-        updateTextureText(scoreTexture, scoreString.c_str(), font, renderer);
+        if (actualBrick->isDestroyed)
+        {
+            bricks.erase(actualBrick);
+        }
+        else
+        {
+            actualBrick++;
+        }
     }
 
     ball.x += ballVelocityX * deltaTime;
     ball.y += ballVelocityY * deltaTime;
-}
-
-void renderSprite(Sprite &sprite)
-{
-    SDL_RenderCopy(renderer, sprite.texture, NULL, &sprite.textureBounds);
 }
 
 void render()
@@ -156,21 +201,35 @@ void render()
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
 
-    SDL_SetRenderDrawColor(renderer, colors[colorIndex].r, colors[colorIndex].g, colors[colorIndex].b, 255);
+    SDL_QueryTexture(scoreTexture, NULL, NULL, &scoreBounds.w, &scoreBounds.h);
+    scoreBounds.x = 300;
+    scoreBounds.y = scoreBounds.h / 2 - 10;
+    SDL_RenderCopy(renderer, scoreTexture, NULL, &scoreBounds);
 
-    SDL_RenderFillRect(renderer, &ball);
-
-    renderSprite(playerSprite);
+    SDL_QueryTexture(liveTexture, NULL, NULL, &liveBounds.w, &liveBounds.h);
+    liveBounds.x = 800;
+    liveBounds.y = liveBounds.h / 2 - 10;
+    SDL_RenderCopy(renderer, liveTexture, NULL, &liveBounds);
 
     if (isGamePaused)
     {
         SDL_RenderCopy(renderer, pauseGameTexture, NULL, &pauseGameBounds);
     }
 
-    SDL_QueryTexture(scoreTexture, NULL, NULL, &scoreBounds.w, &scoreBounds.h);
-    scoreBounds.x = SCREEN_WIDTH / 2 - pauseGameBounds.w / 2;
-    scoreBounds.y = scoreBounds.h / 2;
-    SDL_RenderCopy(renderer, scoreTexture, NULL, &scoreBounds);
+    SDL_SetRenderDrawColor(renderer, 0, 255, 255, 255);
+
+    for (Brick brick : bricks)
+    {
+        if (!brick.isDestroyed)
+        {
+            SDL_RenderFillRect(renderer, &brick.bounds);
+        }
+    }
+
+    SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+
+    SDL_RenderFillRect(renderer, &player);
+    SDL_RenderFillRect(renderer, &ball);
 
     SDL_RenderPresent(renderer);
 }
@@ -181,7 +240,7 @@ int main(int argc, char **argv)
     romfsInit();
     chdir("romfs:/");
 
-    window = SDL_CreateWindow("Wii U SDL Starter", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_SHOWN);
+    window = SDL_CreateWindow("Breakout", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_SHOWN);
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
     if (startSDL(window, renderer) > 0)
@@ -192,43 +251,21 @@ int main(int argc, char **argv)
     SDL_JoystickEventState(SDL_ENABLE);
     SDL_JoystickOpen(0);
 
-    if (SDL_NumJoysticks() < 1)
-    {
-        printf("No game controllers connected!\n");
-        return -1;
-    }
-    else
-    {
-        controller = SDL_GameControllerOpen(0);
-        if (controller == NULL)
-        {
-            printf("Unable to open game controller! SDL Error: %s\n", SDL_GetError());
-            return -1;
-        }
-    }
-
-    playerSprite = loadSprite(renderer, "sprites/alien_1.png", SCREEN_WIDTH / 2 - 100, SCREEN_HEIGHT / 2);
+    controller = SDL_GameControllerOpen(0);
 
     font = TTF_OpenFont("fonts/LeroyLetteringLightBeta01.ttf", 36);
 
-    // render text as texture
-    updateTextureText(scoreTexture, "SCORE: 0", font, renderer);
+    updateTextureText(scoreTexture, "score: 0", font, renderer);
+    updateTextureText(liveTexture, "lives: 2", font, renderer);
 
-    updateTextureText(pauseGameTexture, "GAME PAUSED", font, renderer);
+    updateTextureText(pauseGameTexture, "Game Paused", font, renderer);
 
     SDL_QueryTexture(pauseGameTexture, NULL, NULL, &pauseGameBounds.w, &pauseGameBounds.h);
     pauseGameBounds.x = SCREEN_WIDTH / 2 - pauseGameBounds.w / 2;
-    pauseGameBounds.y = 200;
+    pauseGameBounds.y = SCREEN_HEIGHT / 2 - pauseGameBounds.h / 2;
 
-    // no need to keep the font loaded
-    // TTF_CloseFont(font);
-
-    // load music and sounds from files
-    sound = loadSound("sounds/pop1.wav");
-
-    music = loadMusic("music/background.ogg");
-
-    Mix_PlayMusic(music, -1);
+    collisionSound = loadSound("sounds/pop1.wav");
+    collisionWithPlayerSound = loadSound("sounds/pop2.wav");
 
     Uint32 previousFrameTime = SDL_GetTicks();
     Uint32 currentFrameTime = previousFrameTime;
